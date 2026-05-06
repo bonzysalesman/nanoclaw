@@ -8,11 +8,12 @@
  */
 import fs from 'fs';
 import path from 'path';
-import pino from 'pino';
+import { pino } from 'pino';
 import qrcode from 'qrcode-terminal';
 import readline from 'readline';
 
-import makeWASocket, {
+import {
+  makeWASocket,
   Browsers,
   DisconnectReason,
   fetchLatestWaWebVersion,

@@ -1,13 +1,16 @@
-import { exec } from 'child_process';
+/**
+ * WhatsApp channel adapter (v2) — native Baileys v6 implementation.
+ */
 import fs from 'fs';
 import path from 'path';
-
-import makeWASocket, {
+import { pino } from 'pino';
+import qrcode from 'qrcode-terminal';
+import {
+  makeWASocket,
   Browsers,
   DisconnectReason,
-  downloadMediaMessage,
-  WASocket,
   fetchLatestWaWebVersion,
+  downloadMediaMessage,
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
   useMultiFileAuthState,
@@ -16,414 +19,572 @@ import makeWASocket, {
 import {
   ASSISTANT_HAS_OWN_NUMBER,
   ASSISTANT_NAME,
-  GROUPS_DIR,
-  STORE_DIR,
+  DATA_DIR,
+  getTriggerPattern,
 } from '../config.js';
-import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
-import { logger } from '../logger.js';
-import {
-  Channel,
-  OnInboundMessage,
-  OnChatMetadata,
-  RegisteredGroup,
-} from '../types.js';
-import { registerChannel, ChannelOpts } from './registry.js';
+import { readEnvFile } from '../env.js';
+import { log } from '../log.js';
+import { registerChannelAdapter } from './channel-registry.js';
+import { normalizeOptions } from './ask-question.js';
 
-const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+import { createRequire } from 'module';
+const _require = createRequire(import.meta.url);
+import { exec } from 'child_process';
+import { promisify } from 'util';
+const execAsync = promisify(exec);
+const { proto } = _require('@whiskeysockets/baileys');
 
-export interface WhatsAppChannelOpts {
-  onMessage: OnInboundMessage;
-  onChatMetadata: OnChatMetadata;
-  registeredGroups: () => Record<string, RegisteredGroup>;
+// Patch Baileys v6 platform ID bug for pairing codes
+try {
+  const _generics = _require('@whiskeysockets/baileys/lib/Utils/generics');
+  _generics.getPlatformId = (browser: string) => {
+    const platformType = (proto.DeviceProps.PlatformType as any)[browser.toUpperCase()];
+    return platformType ? platformType.toString() : '1';
+  };
+} catch {
+  log.warn('Could not patch getPlatformId — pairing code auth may fail');
 }
 
-export class WhatsAppChannel implements Channel {
-  name = 'whatsapp';
+const baileysLogger = pino({ level: 'silent' });
+const AUTH_DIR = path.join(process.cwd(), 'store', 'auth');
+const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
+const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min
+const SENT_MESSAGE_CACHE_MAX = 256;
+const RECONNECT_DELAY_MS = 5000;
+const PENDING_QUESTIONS_MAX = 64;
+const TRIGGER_PATTERN = getTriggerPattern();
 
-  private sock!: WASocket;
-  private connected = false;
-  private lidToPhoneMap: Record<string, string> = {};
-  private outgoingQueue: Array<{ jid: string; text: string }> = [];
-  private flushing = false;
-  private groupSyncTimerStarted = false;
+function optionToCommand(option: string): string {
+  return '/' + option.toLowerCase().replace(/\s+/g, '-');
+}
 
-  private opts: WhatsAppChannelOpts;
+function splitProtectedRegions(text: string): { content: string; isProtected: boolean }[] {
+  const segments: { content: string; isProtected: boolean }[] = [];
+  const codeBlockRegex = /```[\s\S]*?```|`[^`\n]+`/g;
+  let lastIndex = 0;
+  let match;
 
-  constructor(opts: WhatsAppChannelOpts) {
-    this.opts = opts;
+  while ((match = codeBlockRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ content: text.slice(lastIndex, match.index), isProtected: false });
+    }
+    segments.push({ content: match[0], isProtected: true });
+    lastIndex = match.index + match[0].length;
   }
 
-  async connect(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      this.connectInternal(resolve).catch(reject);
-    });
+  if (lastIndex < text.length) {
+    segments.push({ content: text.slice(lastIndex), isProtected: false });
   }
 
-  private async connectInternal(onFirstOpen?: () => void): Promise<void> {
-    const authDir = path.join(STORE_DIR, 'auth');
+  return segments;
+}
+
+function transformForWhatsApp(text: string): string {
+  text = text.replace(/(?<!\*)\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?!\*)/g, '_$1_');
+  text = text.replace(/\*\*(?=[^\s*])([^*]+?)(?<=[^\s*])\*\*/g, '*$1*');
+  text = text.replace(/^#{1,6}\s+(.+)$/gm, '*$1*');
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
+  text = text.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, '');
+  return text;
+}
+
+function formatWhatsApp(text: string): string {
+  const segments = splitProtectedRegions(text);
+  return segments.map(({ content, isProtected }) => (isProtected ? content : transformForWhatsApp(content))).join('');
+}
+
+export function detectWhatsAppMention(text: string): boolean {
+  return TRIGGER_PATTERN.test(text.trimStart());
+}
+
+function normalizeChatJid(jid: string): string {
+  if (!jid) return jid;
+  if (jid.includes('@')) return jid;
+  if (/^\d+$/.test(jid)) return `${jid}@s.whatsapp.net`;
+  return jid;
+}
+
+function buildMediaMessage(data: Buffer, filename: string, ext: string, caption?: string) {
+  const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+  const videoExts = ['.mp4', '.mov', '.avi', '.mkv'];
+  const audioExts = ['.mp3', '.ogg', '.m4a', '.wav', '.aac', '.opus'];
+
+  if (imageExts.includes(ext)) {
+    return { image: data, caption, mimetype: `image/${ext.slice(1) === 'jpg' ? 'jpeg' : ext.slice(1)}` };
+  }
+  if (videoExts.includes(ext)) {
+    return { video: data, caption, mimetype: `video/${ext.slice(1)}` };
+  }
+  if (audioExts.includes(ext)) {
+    return { audio: data, mimetype: `audio/${ext.slice(1) === 'mp3' ? 'mpeg' : ext.slice(1)}` };
+  }
+  return { document: data, fileName: filename, caption, mimetype: 'application/octet-stream' };
+}
+
+registerChannelAdapter('whatsapp', {
+  factory: () => {
+    const env = readEnvFile(['WHATSAPP_PHONE_NUMBER', 'WHATSAPP_ENABLED']);
+    const phoneNumber = env.WHATSAPP_PHONE_NUMBER;
+    const authDir = AUTH_DIR;
+
+    const hasAuth = fs.existsSync(path.join(authDir, 'creds.json'));
+    if (!hasAuth && !phoneNumber && !env.WHATSAPP_ENABLED) return null;
+
     fs.mkdirSync(authDir, { recursive: true });
 
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    let sock: any;
+    let connected = false;
+    let setupConfig: any;
+    const lidToPhoneMap: Record<string, string> = {};
+    let botLidUser: string | undefined;
+    const outgoingQueue: Array<{ jid: string; text: string }> = [];
+    let flushing = false;
+    const sentMessageCache = new Map<string, any>();
+    const groupMetadataCache = new Map<string, { metadata: any; expiresAt: number }>();
+    const pendingQuestions = new Map<string, { questionId: string; options: any[] }>();
+    let lastGroupSync = 0;
+    let groupSyncTimerStarted = false;
+    let resolveFirstOpen: any;
+    let rejectFirstOpen: any;
+    const pairingCodeFile = path.join(process.cwd(), 'store', 'pairing-code.txt');
+    let botPhoneJid: string | undefined;
+    let reconnectTimer: NodeJS.Timeout | null = null;
+    let connectAttempt = 0;
 
-    const { version } = await fetchLatestWaWebVersion({}).catch((err) => {
-      logger.warn(
-        { err },
-        'Failed to fetch latest WA Web version, using default',
-      );
-      return { version: undefined };
-    });
-    this.sock = makeWASocket({
-      version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
-      },
-      printQRInTerminal: false,
-      logger,
-      browser: Browsers.macOS('Chrome'),
-    });
+    function setLidPhoneMapping(lidUser: string, phoneJid: string) {
+      if (lidToPhoneMap[lidUser] === phoneJid) return;
+      lidToPhoneMap[lidUser] = phoneJid;
+      groupMetadataCache.clear();
+    }
 
-    this.sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
+    async function translateJid(jid: string): Promise<string> {
+      jid = normalizeChatJid(jid);
+      if (!jid.endsWith('@lid')) return jid;
+      const lidUser = jid.split('@')[0].split(':')[0];
+      const cached = lidToPhoneMap[lidUser];
+      if (cached) return cached;
 
-      if (qr) {
-        const msg =
-          'WhatsApp authentication required. Run /setup in Claude Code.';
-        logger.error(msg);
-        exec(
-          `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
-        );
-        setTimeout(() => process.exit(1), 1000);
-      }
-
-      if (connection === 'close') {
-        this.connected = false;
-        const reason = (
-          lastDisconnect?.error as { output?: { statusCode?: number } }
-        )?.output?.statusCode;
-        const shouldReconnect = reason !== DisconnectReason.loggedOut;
-        logger.info(
-          {
-            reason,
-            shouldReconnect,
-            queuedMessages: this.outgoingQueue.length,
-          },
-          'Connection closed',
-        );
-
-        if (shouldReconnect) {
-          logger.info('Reconnecting...');
-          this.connectInternal().catch((err) => {
-            logger.error({ err }, 'Failed to reconnect, retrying in 5s');
-            setTimeout(() => {
-              this.connectInternal().catch((err2) => {
-                logger.error({ err: err2 }, 'Reconnection retry failed');
-              });
-            }, 5000);
-          });
-        } else {
-          logger.info('Logged out. Run /setup to re-authenticate.');
-          process.exit(0);
+      try {
+        const pn = await sock.signalRepository?.lidMapping?.getPNForLID(jid);
+        if (pn) {
+          const phoneJid = `${pn.split('@')[0].split(':')[0]}@s.whatsapp.net`;
+          setLidPhoneMapping(lidUser, phoneJid);
+          log.info('Translated LID to phone JID', { lidJid: jid, phoneJid });
+          return phoneJid;
         }
-      } else if (connection === 'open') {
-        this.connected = true;
-        logger.info('Connected to WhatsApp');
+      } catch (err) {
+        log.debug('Failed to resolve LID via signalRepository', { jid, err });
+      }
+      return jid;
+    }
 
-        // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
-        this.sock.sendPresenceUpdate('available').catch((err) => {
-          logger.warn({ err }, 'Failed to send presence update');
-        });
+    async function getNormalizedGroupMetadata(jid: string) {
+      if (!jid.endsWith('@g.us')) return undefined;
+      const cached = groupMetadataCache.get(jid);
+      if (cached && cached.expiresAt > Date.now()) return cached.metadata;
 
-        // Build LID to phone mapping from auth state for self-chat translation
-        if (this.sock.user) {
-          const phoneUser = this.sock.user.id.split(':')[0];
-          const lidUser = this.sock.user.lid?.split(':')[0];
-          if (lidUser && phoneUser) {
-            this.lidToPhoneMap[lidUser] = `${phoneUser}@s.whatsapp.net`;
-            logger.debug({ lidUser, phoneUser }, 'LID to phone mapping set');
+      const metadata = await sock.groupMetadata(jid);
+      const participants = await Promise.all(
+        metadata.participants.map(async (p: any) => ({
+          ...p,
+          id: await translateJid(p.id),
+        }))
+      );
+      const normalized = { ...metadata, participants };
+      groupMetadataCache.set(jid, {
+        metadata: normalized,
+        expiresAt: Date.now() + GROUP_METADATA_CACHE_TTL_MS,
+      });
+      return normalized;
+    }
+
+    async function syncGroupMetadata(force = false) {
+      if (!force && lastGroupSync && Date.now() - lastGroupSync < GROUP_SYNC_INTERVAL_MS) return;
+      try {
+        log.info('Syncing group metadata from WhatsApp...');
+        const groups = await sock.groupFetchAllParticipating();
+        let count = 0;
+        for (const [jid, metadata] of Object.entries(groups) as [string, any][]) {
+          if (metadata.subject) {
+            setupConfig.onMetadata(normalizeChatJid(jid), metadata.subject, true);
+            count++;
           }
         }
+        lastGroupSync = Date.now();
+        log.info('Group metadata synced', { count });
+      } catch (err) {
+        log.error('Failed to sync group metadata', { err });
+      }
+    }
 
-        // Flush any messages queued while disconnected
-        this.flushOutgoingQueue().catch((err) =>
-          logger.error({ err }, 'Failed to flush outgoing queue'),
-        );
-
-        // Sync group metadata on startup (respects 24h cache)
-        this.syncGroupMetadata().catch((err) =>
-          logger.error({ err }, 'Initial group sync failed'),
-        );
-        // Set up daily sync timer (only once)
-        if (!this.groupSyncTimerStarted) {
-          this.groupSyncTimerStarted = true;
-          setInterval(() => {
-            this.syncGroupMetadata().catch((err) =>
-              logger.error({ err }, 'Periodic group sync failed'),
-            );
-          }, GROUP_SYNC_INTERVAL_MS);
+    async function flushOutgoingQueue() {
+      if (flushing || outgoingQueue.length === 0) return;
+      flushing = true;
+      try {
+        log.info('Flushing outgoing message queue', { count: outgoingQueue.length });
+        while (outgoingQueue.length > 0) {
+          const item = outgoingQueue.shift()!;
+          const sent = await sock.sendMessage(item.jid, { text: item.text });
+          if (sent?.key?.id && sent.message) {
+            sentMessageCache.set(sent.key.id, sent.message);
+          }
         }
+      } finally {
+        flushing = false;
+      }
+    }
 
-        // Signal first connection to caller
-        if (onFirstOpen) {
-          onFirstOpen();
-          onFirstOpen = undefined;
+    async function downloadInboundMedia(msg: any, normalized: any) {
+      const mediaTypes = [
+        { key: 'imageMessage', type: 'image', ext: '.jpg' },
+        { key: 'videoMessage', type: 'video', ext: '.mp4' },
+        { key: 'audioMessage', type: 'audio', ext: '.ogg' },
+        { key: 'documentMessage', type: 'document', ext: '' },
+      ];
+      const results: any[] = [];
+      for (const { key, type, ext } of mediaTypes) {
+        if (!normalized[key]) continue;
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {});
+          const docFilename = normalized[key].fileName;
+          const filename = docFilename || `${type}-${Date.now()}${ext}`;
+          const attachDir = path.join(DATA_DIR, 'attachments');
+          fs.mkdirSync(attachDir, { recursive: true });
+          const filePath = path.join(attachDir, filename);
+          fs.writeFileSync(filePath, buffer);
+          results.push({ type, name: filename, localPath: `attachments/${filename}` });
+          
+          // Specialize PDF detection for the PDF Reader skill
+          if (normalized[key].mimetype === 'application/pdf') {
+            const sizeKB = Math.round((buffer as Buffer).length / 1024);
+            const pdfRef = `[PDF: attachments/${filename} (${sizeKB}KB)]\nUse: pdf-reader extract attachments/${filename}`;
+            return { isPdf: true, pdfRef, attachments: results };
+          }
+
+          log.info('Media downloaded', { type, filename });
+        } catch (err) {
+          log.warn('Failed to download media', { type, err });
         }
       }
-    });
+      return { isPdf: false, attachments: results };
+    }
 
-    this.sock.ev.on('creds.update', saveCreds);
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectSocket().catch((err) => log.error('Reconnect failed', { err }));
+      }, RECONNECT_DELAY_MS);
+    }
 
-    this.sock.ev.on('messages.upsert', async ({ messages }) => {
-      for (const msg of messages) {
+    async function sendRawMessage(jid: string, text: string) {
+      jid = normalizeChatJid(jid);
+      if (!connected) {
+        throw new Error('WhatsApp is disconnected');
+      }
+      try {
+        const sent = await sock.sendMessage(jid, { text });
+        if (sent?.key?.id && sent.message) {
+          sentMessageCache.set(sent.key.id, sent.message);
+          if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
+            const oldest = sentMessageCache.keys().next().value;
+            if (oldest) sentMessageCache.delete(oldest);
+          }
+        }
+        return sent?.key?.id ?? undefined;
+      } catch (err) {
+        throw err;
+      }
+    }
+
+    async function connectSocket() {
+      connectAttempt++;
+      const attempt = connectAttempt;
+      if (sock) {
         try {
-          if (!msg.message) continue;
-          // Unwrap container types (viewOnceMessageV2, ephemeralMessage,
-          // editedMessage, etc.) so that conversation, extendedTextMessage,
-          // imageMessage, etc. are accessible at the top level.
-          const normalized = normalizeMessageContent(msg.message);
-          if (!normalized) continue;
-          const rawJid = msg.key.remoteJid;
-          if (!rawJid || rawJid === 'status@broadcast') continue;
+          sock.ev.removeAllListeners('connection.update');
+          sock.ev.removeAllListeners('creds.update');
+          sock.ev.removeAllListeners('chats.phoneNumberShare');
+          sock.ev.removeAllListeners('messages.upsert');
+          sock.end(undefined);
+        } catch {
+          // best-effort cleanup of a stale socket before recreating it
+        }
+      }
 
-          // Translate LID JID to phone JID if applicable
-          const chatJid = await this.translateJid(rawJid);
+      const { state, saveCreds } = await useMultiFileAuthState(authDir);
+      const { version } = await fetchLatestWaWebVersion({}).catch((err) => {
+        log.warn('Failed to fetch latest WA Web version, using default', { err });
+        return { version: undefined };
+      });
 
-          const timestamp = new Date(
-            Number(msg.messageTimestamp) * 1000,
-          ).toISOString();
+      sock = makeWASocket({
+        version,
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+        },
+        printQRInTerminal: false,
+        logger: baileysLogger,
+        browser: Browsers.macOS('Chrome'),
+        cachedGroupMetadata: async (jid: string) => getNormalizedGroupMetadata(jid),
+        getMessage: async (key: any) => {
+          const cached = sentMessageCache.get(key.id || '');
+          if (cached) return cached;
+          return proto.Message.fromObject({});
+        },
+      });
 
-          // Always notify about chat metadata for group discovery
-          const isGroup = chatJid.endsWith('@g.us');
-          this.opts.onChatMetadata(
-            chatJid,
-            timestamp,
-            undefined,
-            'whatsapp',
-            isGroup,
-          );
+      if (phoneNumber && !state.creds.registered) {
+        setTimeout(async () => {
+          try {
+            const code = await sock.requestPairingCode(phoneNumber);
+            log.info(`WhatsApp pairing code: ${code}`);
+            fs.writeFileSync(pairingCodeFile, code, 'utf-8');
+          } catch (err) {
+            log.error('Failed to request pairing code', { err });
+          }
+        }, 3000);
+      }
 
-          // Only deliver full message for registered groups
-          const groups = this.opts.registeredGroups();
-          if (groups[chatJid]) {
-            let content =
-              normalized.conversation ||
+      sock.ev.on('connection.update', (update: any) => {
+        if (attempt !== connectAttempt) return;
+        const { connection, lastDisconnect, qr } = update;
+        if (qr && !phoneNumber) {
+          (async () => {
+             try {
+               const QRCode = await import('qrcode');
+               const qrText = await QRCode.toString(qr, { type: 'terminal' });
+               log.info('WhatsApp QR code:\n' + qrText);
+             } catch {
+               log.info('WhatsApp QR code (raw)', { qr });
+             }
+          })();
+        }
+
+        if (connection === 'close') {
+          connected = false;
+          const reason = (lastDisconnect?.error as any)?.output?.statusCode;
+          const shouldReconnect = reason !== DisconnectReason.loggedOut;
+          log.warn('WhatsApp connection closed', { reason, shouldReconnect });
+          if (shouldReconnect) {
+            scheduleReconnect();
+          }
+        } else if (connection === 'open') {
+          if (!connected) {
+            connected = true;
+            log.info('Connected to WhatsApp');
+          }
+          if (sock.user) {
+            const phoneUser = normalizeChatJid(sock.user.id.split(':')[0]);
+            if (phoneUser) {
+              botPhoneJid = phoneUser;
+            }
+            const lidUser = sock.user.lid?.split(':')[0];
+            if (lidUser && botPhoneJid) {
+              setLidPhoneMapping(lidUser, botPhoneJid);
+              botLidUser = lidUser;
+            }
+          }
+          flushOutgoingQueue().catch(err => log.error('Flush failed', { err }));
+          syncGroupMetadata().catch(err => log.error('Sync failed', { err }));
+          if (resolveFirstOpen) {
+            resolveFirstOpen();
+            resolveFirstOpen = undefined;
+          }
+        }
+      });
+
+      sock.ev.on('creds.update', saveCreds);
+
+      // @ts-ignore
+      sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
+        if (attempt !== connectAttempt) return;
+        const lidUser = lid?.split('@')[0].split(':')[0];
+        if (lidUser && jid) setLidPhoneMapping(lidUser, normalizeChatJid(jid));
+      });
+
+      sock.ev.on('messages.upsert', async ({ messages }: any) => {
+        if (attempt !== connectAttempt) return;
+        for (const msg of messages) {
+          try {
+            if (!msg.message) continue;
+            const normalized = normalizeMessageContent(msg.message);
+            if (!normalized) continue;
+            const rawJid = msg.key.remoteJid;
+            if (!rawJid || rawJid === 'status@broadcast') continue;
+
+            const chatJid = normalizeChatJid(await translateJid(rawJid));
+            const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
+            const isGroup = chatJid.endsWith('@g.us');
+            setupConfig.onMetadata(chatJid, undefined, isGroup);
+
+            let content = normalized.conversation ||
               normalized.extendedTextMessage?.text ||
               normalized.imageMessage?.caption ||
               normalized.videoMessage?.caption ||
               '';
 
-            // PDF attachment handling
-            if (normalized?.documentMessage?.mimetype === 'application/pdf') {
-              try {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                const groupDir = path.join(GROUPS_DIR, groups[chatJid].folder);
-                const attachDir = path.join(groupDir, 'attachments');
-                fs.mkdirSync(attachDir, { recursive: true });
-                const filename = path.basename(
-                  normalized.documentMessage.fileName ||
-                  `doc-${Date.now()}.pdf`,
-                );
-                const filePath = path.join(attachDir, filename);
-                fs.writeFileSync(filePath, buffer as Buffer);
-                const sizeKB = Math.round((buffer as Buffer).length / 1024);
-                const pdfRef = `[PDF: attachments/${filename} (${sizeKB}KB)]\nUse: pdf-reader extract attachments/${filename}`;
-                const caption = normalized.documentMessage.caption || '';
-                content = caption ? `${caption}\n\n${pdfRef}` : pdfRef;
-                logger.info(
-                  { jid: chatJid, filename },
-                  'Downloaded PDF attachment',
-                );
-              } catch (err) {
-                logger.warn(
-                  { err, jid: chatJid },
-                  'Failed to download PDF attachment',
-                );
-              }
+            if (botLidUser && content.includes(`@${botLidUser}`)) {
+              content = content.replace(`@${botLidUser}`, `@${ASSISTANT_NAME}`);
             }
 
-            // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
-            if (!content) continue;
+            // Download media attachments (images, video, audio, documents)
+            const mediaResult = await downloadInboundMedia(msg, normalized);
+            if (mediaResult.isPdf) {
+              content = content ? `${content}\n\n${mediaResult.pdfRef}` : (mediaResult.pdfRef as string);
+            }
+            const attachments = mediaResult.attachments;
+
+            // Skip empty protocol messages (no text and no attachments)
+            if (!content && attachments.length === 0) continue;
 
             const sender = msg.key.participant || msg.key.remoteJid || '';
             const senderName = msg.pushName || sender.split('@')[0];
-
             const fromMe = msg.key.fromMe || false;
-            // Detect bot messages: with own number, fromMe is reliable
-            // since only the bot sends from that number.
-            // With shared number, bot messages carry the assistant name prefix
-            // (even in DMs/self-chat) so we check for that.
-            const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
-              ? fromMe
-              : content.startsWith(`${ASSISTANT_NAME}:`);
+            // DEBUG LOGGING: Check if message is from me and if it's being skipped.
+            if (chatJid === '120363426637828142@g.us') { // 'NanoClaw' group JID
+              log.debug('WhatsApp message `fromMe` check', {
+                fromMe: fromMe,
+                chatJid: chatJid,
+                botPhoneJid: botPhoneJid,
+                messageId: msg.key.id,
+              });
+            }
 
-            this.opts.onMessage(chatJid, {
-              id: msg.key.id || '',
-              chat_jid: chatJid,
-              sender,
-              sender_name: senderName,
-              content,
+            if (fromMe) {
+              const isSelfChat = chatJid === botPhoneJid;
+              if (!isSelfChat || (msg.key.id && sentMessageCache.has(msg.key.id))) {
+                continue;
+              }
+            }
+
+            const isBotMessage = ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`);
+
+            const inbound = {
+              id: msg.key.id || `wa-${Date.now()}`,
+              kind: 'chat',
+              content: {
+                text: content,
+                sender,
+                senderName,
+                ...(attachments.length > 0 && { attachments }),
+                fromMe,
+                isBotMessage,
+                isGroup,
+                chatJid,
+              },
               timestamp,
-              is_from_me: fromMe,
-              is_bot_message: isBotMessage,
-            });
+              isMention: detectWhatsAppMention(content),
+              isGroup,
+            };
+            setupConfig.onInbound(chatJid, null, inbound);
+          } catch (err) {
+            log.error('Error processing WhatsApp message', { err });
           }
-        } catch (err) {
-          logger.error(
-            { err, remoteJid: msg.key?.remoteJid },
-            'Error processing incoming message',
-          );
         }
-      }
-    });
-  }
-
-  async sendMessage(jid: string, text: string): Promise<void> {
-    // Prefix bot messages with assistant name so users know who's speaking.
-    // On a shared number, prefix is also needed in DMs (including self-chat)
-    // to distinguish bot output from user messages.
-    // Skip only when the assistant has its own dedicated phone number.
-    const prefixed = ASSISTANT_HAS_OWN_NUMBER
-      ? text
-      : `${ASSISTANT_NAME}: ${text}`;
-
-    if (!this.connected) {
-      this.outgoingQueue.push({ jid, text: prefixed });
-      logger.info(
-        { jid, length: prefixed.length, queueSize: this.outgoingQueue.length },
-        'WA disconnected, message queued',
-      );
-      return;
+      });
     }
-    try {
-      await this.sock.sendMessage(jid, { text: prefixed });
-      logger.info({ jid, length: prefixed.length }, 'Message sent');
-    } catch (err) {
-      // If send fails, queue it for retry on reconnect
-      this.outgoingQueue.push({ jid, text: prefixed });
-      logger.warn(
-        { jid, err, queueSize: this.outgoingQueue.length },
-        'Failed to send, message queued',
-      );
-    }
-  }
 
-  isConnected(): boolean {
-    return this.connected;
-  }
+    const adapter: any = {
+      name: 'whatsapp',
+      channelType: 'whatsapp',
+      supportsThreads: false,
+      async setup(hostConfig: any) {
+        setupConfig = hostConfig;
+        await new Promise<void>((resolve, reject) => {
+          resolveFirstOpen = resolve;
+          rejectFirstOpen = reject;
+          connectSocket().catch(reject);
+        });
+      },
+      async deliver(platformId: string, _threadId: string | null, message: any) {
+        const content = message.content;
+        if (content.type === 'ask_question' && content.questionId && content.options) {
+          const options = normalizeOptions(content.options);
+          const optionLines = options.map((o: any) => `  ${optionToCommand(o.label)}`).join('\n');
+          const text = `*${content.title}*\n\n${content.question}\n\nReply with:\n${optionLines}`;
+          const msgId = await sendRawMessage(platformId, text);
+          if (msgId) {
+            pendingQuestions.set(platformId, { questionId: content.questionId, options });
+          }
+          return msgId;
+        }
 
-  ownsJid(jid: string): boolean {
-    return jid.endsWith('@g.us') || jid.endsWith('@s.whatsapp.net');
-  }
-
-  async disconnect(): Promise<void> {
-    this.connected = false;
-    this.sock?.end(undefined);
-  }
-
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
-    try {
-      const status = isTyping ? 'composing' : 'paused';
-      logger.debug({ jid, status }, 'Sending presence update');
-      await this.sock.sendPresenceUpdate(status, jid);
-    } catch (err) {
-      logger.debug({ jid, err }, 'Failed to update typing status');
-    }
-  }
-
-  async syncGroups(force: boolean): Promise<void> {
-    return this.syncGroupMetadata(force);
-  }
-
-  /**
-   * Sync group metadata from WhatsApp.
-   * Fetches all participating groups and stores their names in the database.
-   * Called on startup, daily, and on-demand via IPC.
-   */
-  async syncGroupMetadata(force = false): Promise<void> {
-    if (!force) {
-      const lastSync = getLastGroupSync();
-      if (lastSync) {
-        const lastSyncTime = new Date(lastSync).getTime();
-        if (Date.now() - lastSyncTime < GROUP_SYNC_INTERVAL_MS) {
-          logger.debug({ lastSync }, 'Skipping group sync - synced recently');
+        if (content.operation === 'reaction' && content.messageId && content.emoji) {
+          try {
+            await sock.sendMessage(platformId, { react: { text: content.emoji, key: { remoteJid: platformId, id: content.messageId, fromMe: false } } });
+          } catch {}
           return;
         }
-      }
-    }
 
-    try {
-      logger.info('Syncing group metadata from WhatsApp...');
-      const groups = await this.sock.groupFetchAllParticipating();
+        const text = content.markdown || content.text;
+        const hasFiles = message.files && message.files.length > 0;
+        if (!text && !hasFiles) return;
 
-      let count = 0;
-      for (const [jid, metadata] of Object.entries(groups)) {
-        if (metadata.subject) {
-          updateChatName(jid, metadata.subject);
-          count++;
+        if (hasFiles) {
+          let captionUsed = false;
+          for (const file of message.files) {
+            const ext = path.extname(file.filename).toLowerCase();
+            const caption = !captionUsed ? text : undefined;
+            const mediaMsg = buildMediaMessage(file.data, file.filename, ext, caption);
+            await sock.sendMessage(platformId, mediaMsg);
+            captionUsed = true;
+          }
+          if (captionUsed) return;
         }
-      }
 
-      setLastGroupSync();
-      logger.info({ count }, 'Group metadata synced');
-    } catch (err) {
-      logger.error({ err }, 'Failed to sync group metadata');
-    }
-  }
+        if (text) {
+          const formatted = formatWhatsApp(text);
+          const prefixed = ASSISTANT_HAS_OWN_NUMBER ? formatted : `${ASSISTANT_NAME}: ${formatted}`;
+          return sendRawMessage(platformId, prefixed);
+        }
+      },
+      async setTyping(platformId: string) {
+        try { await sock.sendPresenceUpdate('composing', platformId); } catch {}
+      },
+      async teardown() {
+        connected = false;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        sock?.end(undefined);
+      },
+      isConnected() { return connected; },
+      async syncConversations() {
+        try {
+          const groups = await sock.groupFetchAllParticipating();
+          return Object.entries(groups).map(([jid, m]: [string, any]) => ({ platformId: jid, name: m.subject, isGroup: true }));
+        } catch { return []; }
+      },
+    };
+    return adapter;
+  },
+});
 
-  private async translateJid(jid: string): Promise<string> {
-    if (!jid.endsWith('@lid')) return jid;
-    const lidUser = jid.split('@')[0].split(':')[0];
-
-    // Check local cache first
-    const cached = this.lidToPhoneMap[lidUser];
-    if (cached) {
-      logger.debug(
-        { lidJid: jid, phoneJid: cached },
-        'Translated LID to phone JID (cached)',
-      );
-      return cached;
-    }
-
-    // Query Baileys' signal repository for the mapping
-    try {
-      const pn = await this.sock.signalRepository?.lidMapping?.getPNForLID(jid);
-      if (pn) {
-        const phoneJid = `${pn.split('@')[0].split(':')[0]}@s.whatsapp.net`;
-        this.lidToPhoneMap[lidUser] = phoneJid;
-        logger.info(
-          { lidJid: jid, phoneJid },
-          'Translated LID to phone JID (signalRepository)',
-        );
-        return phoneJid;
-      }
-    } catch (err) {
-      logger.debug({ err, jid }, 'Failed to resolve LID via signalRepository');
-    }
-
-    return jid;
-  }
-
-  private async flushOutgoingQueue(): Promise<void> {
-    if (this.flushing || this.outgoingQueue.length === 0) return;
-    this.flushing = true;
-    try {
-      logger.info(
-        { count: this.outgoingQueue.length },
-        'Flushing outgoing message queue',
-      );
-      while (this.outgoingQueue.length > 0) {
-        const item = this.outgoingQueue.shift()!;
-        // Send directly — queued items are already prefixed by sendMessage
-        await this.sock.sendMessage(item.jid, { text: item.text });
-        logger.info(
-          { jid: item.jid, length: item.text.length },
-          'Queued message sent',
-        );
-      }
-    } finally {
-      this.flushing = false;
-    }
-  }
+interface PdfMetadata {
+  path: string;
+  pages?: number;
+  size?: number;
+  info?: string;
 }
 
-registerChannel('whatsapp', (opts: ChannelOpts) => new WhatsAppChannel(opts));
+async function getPdfMetadata(path: string): Promise<PdfMetadata | undefined> {
+  try {
+    const { stdout } = await execAsync(`pdfinfo "${path}"`);
+    const pagesMatch = stdout.match(/Pages:\s+(\d+)/);
+    const pages = pagesMatch ? parseInt(pagesMatch[1], 10) : undefined;
+    const stats = fs.statSync(path);
+    const size = stats.size;
+    return {
+      path,
+      pages,
+      size,
+      info: stdout.trim(),
+    };
+  } catch (error: any) {
+    log.error('Failed to get PDF metadata', { path, error: error.message });
+    return undefined;
+  }
+}
