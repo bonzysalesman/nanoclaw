@@ -308,6 +308,13 @@ function buildMounts(
     mounts.push({ hostPath: skillsSrc, containerPath: '/app/skills', readonly: true });
   }
 
+  // Knowledge-work plugins — skill content referenced by container/skills/marketing,
+  // product-management, productivity SKILL.md files.
+  const pluginsSrc = path.join(projectRoot, 'knowledge-work-plugins');
+  if (fs.existsSync(pluginsSrc)) {
+    mounts.push({ hostPath: pluginsSrc, containerPath: '/app/knowledge-work-plugins', readonly: true });
+  }
+
   // Additional mounts from container config
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
