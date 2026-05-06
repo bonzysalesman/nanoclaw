@@ -16,12 +16,7 @@ import {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
-import {
-  ASSISTANT_HAS_OWN_NUMBER,
-  ASSISTANT_NAME,
-  DATA_DIR,
-  getTriggerPattern,
-} from '../config.js';
+import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, DATA_DIR, getTriggerPattern } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -188,7 +183,7 @@ registerChannelAdapter('whatsapp', {
         metadata.participants.map(async (p: any) => ({
           ...p,
           id: await translateJid(p.id),
-        }))
+        })),
       );
       const normalized = { ...metadata, participants };
       groupMetadataCache.set(jid, {
@@ -253,7 +248,7 @@ registerChannelAdapter('whatsapp', {
           const filePath = path.join(attachDir, filename);
           fs.writeFileSync(filePath, buffer);
           results.push({ type, name: filename, localPath: `attachments/${filename}` });
-          
+
           // Specialize PDF detection for the PDF Reader skill
           if (normalized[key].mimetype === 'application/pdf') {
             const sizeKB = Math.round((buffer as Buffer).length / 1024);
@@ -352,13 +347,13 @@ registerChannelAdapter('whatsapp', {
         const { connection, lastDisconnect, qr } = update;
         if (qr && !phoneNumber) {
           (async () => {
-             try {
-               const QRCode = await import('qrcode');
-               const qrText = await QRCode.toString(qr, { type: 'terminal' });
-               log.info('WhatsApp QR code:\n' + qrText);
-             } catch {
-               log.info('WhatsApp QR code (raw)', { qr });
-             }
+            try {
+              const QRCode = await import('qrcode');
+              const qrText = await QRCode.toString(qr, { type: 'terminal' });
+              log.info('WhatsApp QR code:\n' + qrText);
+            } catch {
+              log.info('WhatsApp QR code (raw)', { qr });
+            }
           })();
         }
 
@@ -386,8 +381,8 @@ registerChannelAdapter('whatsapp', {
               botLidUser = lidUser;
             }
           }
-          flushOutgoingQueue().catch(err => log.error('Flush failed', { err }));
-          syncGroupMetadata().catch(err => log.error('Sync failed', { err }));
+          flushOutgoingQueue().catch((err) => log.error('Flush failed', { err }));
+          syncGroupMetadata().catch((err) => log.error('Sync failed', { err }));
           if (resolveFirstOpen) {
             resolveFirstOpen();
             resolveFirstOpen = undefined;
@@ -419,7 +414,8 @@ registerChannelAdapter('whatsapp', {
             const isGroup = chatJid.endsWith('@g.us');
             setupConfig.onMetadata(chatJid, undefined, isGroup);
 
-            let content = normalized.conversation ||
+            let content =
+              normalized.conversation ||
               normalized.extendedTextMessage?.text ||
               normalized.imageMessage?.caption ||
               normalized.videoMessage?.caption ||
@@ -443,7 +439,8 @@ registerChannelAdapter('whatsapp', {
             const senderName = msg.pushName || sender.split('@')[0];
             const fromMe = msg.key.fromMe || false;
             // DEBUG LOGGING: Check if message is from me and if it's being skipped.
-            if (chatJid === '120363426637828142@g.us') { // 'NanoClaw' group JID
+            if (chatJid === '120363426637828142@g.us') {
+              // 'NanoClaw' group JID
               log.debug('WhatsApp message `fromMe` check', {
                 fromMe: fromMe,
                 chatJid: chatJid,
@@ -513,7 +510,9 @@ registerChannelAdapter('whatsapp', {
 
         if (content.operation === 'reaction' && content.messageId && content.emoji) {
           try {
-            await sock.sendMessage(platformId, { react: { text: content.emoji, key: { remoteJid: platformId, id: content.messageId, fromMe: false } } });
+            await sock.sendMessage(platformId, {
+              react: { text: content.emoji, key: { remoteJid: platformId, id: content.messageId, fromMe: false } },
+            });
           } catch {}
           return;
         }
@@ -541,7 +540,9 @@ registerChannelAdapter('whatsapp', {
         }
       },
       async setTyping(platformId: string) {
-        try { await sock.sendPresenceUpdate('composing', platformId); } catch {}
+        try {
+          await sock.sendPresenceUpdate('composing', platformId);
+        } catch {}
       },
       async teardown() {
         connected = false;
@@ -551,12 +552,20 @@ registerChannelAdapter('whatsapp', {
         }
         sock?.end(undefined);
       },
-      isConnected() { return connected; },
+      isConnected() {
+        return connected;
+      },
       async syncConversations() {
         try {
           const groups = await sock.groupFetchAllParticipating();
-          return Object.entries(groups).map(([jid, m]: [string, any]) => ({ platformId: jid, name: m.subject, isGroup: true }));
-        } catch { return []; }
+          return Object.entries(groups).map(([jid, m]: [string, any]) => ({
+            platformId: jid,
+            name: m.subject,
+            isGroup: true,
+          }));
+        } catch {
+          return [];
+        }
       },
     };
     return adapter;
